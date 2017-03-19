@@ -1,6 +1,7 @@
 """Generate a fully supervised trace for addition."""
 import time
 import logging
+import functools
 import numpy as np
 import gym
 from gym import error, spaces, utils
@@ -12,27 +13,87 @@ logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
 
-class Pointer(object):
-    IN1 = 0
-    IN2 = 1
-    CARRY = 2
-    OUT = 3
+class ProgramNode(object):
+    def __init__(self, prev, prog_name, entry_obs):
+        self.prog_name = prog_name
+        self.entry_obs = entry_obs
+        self.exit_obs = None
+        self.prev_node = prev
+        self.subprograms = []
+        self.sub_index = 0
+        self.time_step = 0
+        self.ret = False
+
+    def step(self, prog, ret, obs):
+        """Each step the agent has done one of three things:
+            1. Exited the current program
+            2. Entered a new subprogram
+            3. Executed a primitive operation
+
+        This checks each possibility in turn, verifying that the agent complied
+        with the trace.
+        """
+        self.time_step += 1
+        if self.time_step > self.time_limit:
+            return (None, -1.0, True)
+
+        # Exited?
+        if self.ret:
+            if obs != self.exit_obs:
+                return self.failed()
+            elif not self.completed_all_subprograms():
+                return self.failed()
+            else:
+                return (self.prev_node, 1.0, False)
+        self.ret = ret
+
+        # Executed primitive? Just keep on going...
+        if prog == 'act':
+            return (self, 0.0, False)
+
+        # Must have called subprogram
+        if not self.subprograms:
+            return self.failed()
+        else:
+            if prog != self.subprograms[self.sub_index].prog_name:
+                return self.failed()
+            elif obs != self.subprograms[self.sub_index].entry_obs:
+                return self.failed()
+            else:
+                # The most important state. The agent successfully called a
+                # subprogram.
+                self.sub_index += 1
+                return (self.subprograms[self.sub_index], 1.0, False)
+
+    def failed(self):
+        """There are a million ways to fail. So this makes it easy to handle.
+        """
+        return (None, -1.0, True)
+
+    def completed_all_subprograms(self):
+        return self.sub_index == len(self.subprograms)
 
 
-class Arg(object):
-    NO_ARG = 0
-    LEFT = 1
-    RIGHT = 2
+def program_wrapper(f):
+    @functools.wraps(f)
+    def wrapper(self, *args, **kwargs):
+        name = f.__name__.lstrip('_')
+        node = ProgramNode(name, self._get_obs())
+        f(self, node, *args, **kwargs)
+        node.exit_obs = self._get_obs()
+        return program
+
+    return wrapper
 
 
 class NPIAddEnv(gym.Env):
     metadata = {'render.modes': ['human']}
 
-    OPERATIONS = ['write', 'ptr']
-    WRITE = 0
-    PTR = 1
-
+    PROGRAMS = ['act', 'lshift', 'carry', 'add1', 'add']
+    PRIMITIVES = ['write', 'ptr']
     POINTERS = ['in1', 'in2', 'carry', 'out']
+    ARGS = ['left', 'right']
+    BASE = 10
 
     def __init__(self):
         # Begin diagnostics
@@ -47,26 +108,24 @@ class NPIAddEnv(gym.Env):
         self._last_episode_id = -1
         # End diagnostics
 
-        self.base = 10
-        # Three sub-actions:
-        #      1. Operation, ie write to a ptr, or move a pointer
-        #      2 & 3. Arguments for the operation, ie which pointer, what value
+        # Four sub-actions:
+        #      1. High-level function, ie write to a ptr, or move a pointer
+        #      2 - 4. Arguments for the high-level function, ie, low-level
+        #             operation, which pointer, what value.
         self.action_space = Tuple(
             [
-                Discrete(len(self.OPERATIONS)),
+                Discrete(len(self.PROGRAMS)),
+                Discrete(len(self.PRIMITIVES)),
                 Discrete(len(self.POINTERS)),
-                Discrete(self.base)
+                Discrete(self.BASE)
             ]
         )
-        self.prog_action_space = Discrete(len(self.OPERATIONS))
-        self.arg1_action_space = Discrete(len(self.POINTERS))
-        self.arg2_action_space = Discrete(self.base)
+        self.prog_action_space = Discrete(len(self.PROGRAMS))
+        self.arg1_action_space = Discrete(len(self.PRIMITIVES))
+        self.arg2_action_space = Discrete(len(self.POINTERS))
+        self.arg3_action_space = Discrete(self.base)
 
         self.observation_space = Discrete(4)
-
-        self._wrote_bad_output = False
-        self._wrote_good_output = False
-        self._truth_check_col = 4
 
         self._init_scratch = np.array([[0, 0, 0, 9, 6],
                                        [0, 0, 1, 2, 5],
@@ -77,147 +136,43 @@ class NPIAddEnv(gym.Env):
 
         self.step_sum = 0
 
-        self._truth_trace = []
-        self._agent_trace = []
+        self._trace = []
+        self._cur_target_node = None
         self.time = 0
 
-        self._target_output = None
-        self._generate_truth()
+    def _reset(self):
+        self.step_sum = 0
+        self.time = 0
 
-    def _get_ptr(self, ptr):
-        try:
-            return self._scratch[
-                ptr, self._ptrs[ptr]
-            ]
-        except IndexError:
-            return None
+        self._generate_trace()
+        self._cur_node = self._trace
 
-    @property
-    def _ptr_in1(self):
-        return self._get_ptr(Pointer.IN1)
+        return self._after_reset(self._get_obs())
 
-    @property
-    def _ptr_in2(self):
-        return self._get_ptr(Pointer.IN2)
-
-    @property
-    def _ptr_carry(self):
-        return self._get_ptr(Pointer.CARRY)
-
-    @property
-    def _ptr_out(self):
-        return self._get_ptr(Pointer.OUT)
-
-    def _read_scratch(self):
-        return [
-            self._ptr_in1,
-            self._ptr_in2,
-            self._ptr_carry,
-            self._ptr_out
-        ]
-
-    def _reset_scratch(self):
-        self._scratch = np.copy(self._init_scratch)
-        self._ptrs = [4, 4, 4, 4]
-
-    def _amend_trace(self, trace):
-        obs = self._read_scratch()
-        if trace == 'truth':
-            self._truth_trace.append(obs)
-        else:
-            self._agent_trace.append(obs)
-
-    # Primitive Operations
-    def _write(self, ptr_id, value, trace='truth'):
-        write_col = self._ptrs[ptr_id]
-        self._scratch[ptr_id, write_col] = value
-        self._amend_trace(trace)
-
-        if trace != 'truth' and ptr_id == Pointer.OUT:
-            if value != self._target_output[write_col]:
-                self._wrote_bad_output = True
-
-            if write_col == self._truth_check_col:
-                truth_out = self._target_output[self._truth_check_col]
-                if value == truth_out:
-                    self._truth_check_col -= 1
-                    self._wrote_good_output = True
-
-
-    def _ptr(self, ptr_id, direction, trace='truth'):
-        if direction == Arg.LEFT:
-            self._ptrs[ptr_id] -= 1
-        elif direction == Arg.RIGHT:
-            self._ptrs[ptr_id] += 1
-
-        self._amend_trace(trace)
-
-    # Compound Operations
-    def _carry(self):
-        self._ptr(Pointer.CARRY, Arg.LEFT)
-        self._write(Pointer.CARRY, 1)
-        self._ptr(Pointer.CARRY, Arg.RIGHT)
-
-    def _add1(self):
-        if self.step_sum > 9:
-            out_value = self.step_sum % 10
-            self._write(Pointer.OUT, out_value)
-            self._carry()
-        else:
-            self._write(Pointer.OUT, self.step_sum)
-
-    def _add(self):
-        while self._keep_adding():
-            self._add1()
-            self._lshift()
-
-    def _lshift(self):
-        self._ptr(Pointer.IN1, Arg.LEFT)
-        self._ptr(Pointer.IN2, Arg.LEFT)
-        self._ptr(Pointer.CARRY, Arg.LEFT)
-        self._ptr(Pointer.OUT, Arg.LEFT)
-
-    def _keep_adding(self):
-        self.step_sum = (self._ptr_in1 + self._ptr_in2 + self._ptr_carry)
-
-        return self.step_sum != 0
-
-    def _generate_truth(self):
-        self._reset_scratch()
-        self._add()
-        self._target_output = self._scratch[Pointer.OUT]
+    def _generate_trace(self):
+        # Clear agent's scratch pad
         self._reset_scratch()
 
-    @property
-    def time_limit(self):
-        # Why not?
-        return len(self._truth_trace) * 2
+        self._trace = self._add()
 
-    # def _reward(self):
-    #     out_line = self._scratch[3]
-    #     agent_out = out_line[self._truth_check_pos]
-    #     truth_out = self._target_output[self._truth_check_pos]
-    #     if agent_out == truth_out:
-    #         self._truth_check_pos -= 1
-    #         return 1.0
-
-    #     return 0.0
+        # Clear truth scratch pad for agent
+        self._reset_scratch()
 
     def _step(self, action):
         assert self.action_space.contains(action)
-        self._wrote_bad_output = False
-        op, arg1, arg2 = action
+        prog, arg1, arg2, arg3 = action
         done = False
         reward = 0.0
-        #assert self._ptrs[Pointer.OUT] >= 0
+2        #assert self._ptrs[Pointer.OUT] >= 0
 
-        # Do stuff
-        if op == self.WRITE:
-            self._write(arg1, arg2, trace='agent')
-        elif op == self.PTR:
-            self._ptr(arg1, arg2, trace='agent')
+        # Alter environment
+        if prog == self.PROGRAMS.index('act'):
+            if arg1 == self.PRIMITIVES.index('write'):
+                self._write(arg2, arg3)
+            elif arg1 == self.PRIMITIVES.index('ptr'):
+                self._ptr(arg2, arg3)
 
-        obs = self._read_scratch()
+        obs = self._get_obs()
 
         self.time += 1
         # Terminate if agent took too long
@@ -251,37 +206,101 @@ class NPIAddEnv(gym.Env):
         return self._after_step(obs, reward, done, {})
         #return (obs, reward, done, {})
 
-    def _reset(self):
-        #self._reset_scratch()
+    def _get_ptr(self, ptr):
+        try:
+            return self._scratch[
+                ptr, self._ptrs[ptr]
+            ]
+        except IndexError:
+            return None
 
-        self._wrote_bad_output = False
-        self._wrote_good_output = False
-        self._truth_check_col = 4
-        self.step_sum = 0
-        self._truth_trace = []
-        self._agent_trace = []
-        self.time = 0
-        self._target_output = None
+    @property
+    def _ptr_in1(self):
+        return self._get_ptr(self.POINTERS.index('in1'))
 
-        self._generate_truth()
+    @property
+    def _ptr_in2(self):
+        return self._get_ptr(self.POINTERS.index('in2'))
 
-        return self._after_reset(self._read_scratch())
-        #return self._read_scratch()
+    @property
+    def _ptr_carry(self):
+        return self._get_ptr(self.POINTERS.index('carry'))
 
-    def _after_reset(self, observation):
-        logger.info('Resetting environment')
-        self._episode_reward = 0
-        self._episode_length = 0
-        self._all_rewards = []
-        return observation
+    @property
+    def _ptr_out(self):
+        return self._get_ptr(self.POINTERS.index('out'))
+
+    def _get_obs(self):
+        return [
+            self._ptr_in1,
+            self._ptr_in2,
+            self._ptr_carry,
+            self._ptr_out
+        ]
+
+    def _reset_scratch(self):
+        self._scratch = np.copy(self._init_scratch)
+        self._ptrs = [4, 4, 4, 4]
+
+    # Primitive Operations
+    def _write(self, ptr_id, value):
+        write_col = self._ptrs[ptr_id]
+        self._scratch[ptr_id, write_col] = value
+
+    def _ptr(self, ptr_id, direction):
+        if direction == self.ARGS.index('left'):
+            self._ptrs[ptr_id] -= 1
+        elif direction == self.ARGS.index('right'):
+            self._ptrs[ptr_id] += 1
+
+    # Compound Operations
+    @program_wrapper
+    def _carry(self, program):
+        self._ptr(self.POINTERS.index('carry'), self.ARGS.index('left'))
+        self._write(self.POINTERS.index('carry'), 1)
+        self._ptr(self.POINTERS.index('carry'), self.ARGS.index('right'))
+
+    @program_wrapper
+    def _lshift(self, program):
+        node.subprograms.append(
+            self._ptr(self.POINTERS.index('in1'), self.ARGS.index('left'))
+        )
+        node.subprograms.append(
+            self._ptr(self.POINTERS.index('in2'), self.ARGS.index('left'))
+        )
+        node.subprograms.append(
+            self._ptr(self.POINTERS.index('carry'), self.ARGS.index('left'))
+        )
+        node.subprograms.append(
+            self._ptr(self.POINTERS.index('out'), self.ARGS.index('left'))
+        )
+
+    @program_wrapper
+    def _add1(self, program):
+        if self.step_sum > 9:
+            out_value = self.step_sum % 10
+            self._write(self.POINTERS.index('out'), out_value)
+            node.subprograms.append(self._carry())
+        else:
+            self._write(self.POINTERS.index('out'), self.step_sum)
+
+    @program_wrapper
+    def _add(self, program):
+        while self._keep_adding():
+            add1 = self._add1()
+            node.subprograms.append(add1)
+            lshift = self._lshift()
+            node.subprograms.append(lshift)
+
+    def _keep_adding(self):
+        self.step_sum = (self._ptr_in1 + self._ptr_in2 + self._ptr_carry)
+
+        return self.step_sum != 0
 
     def _render(self, mode='human', close=False):
         pass
 
     def _after_step(self, observation, reward, done, info):
-        self._wrote_bad_output = False
-        self._wrote_good_output = False
-
         to_log = {}
         if self._episode_length == 0:
             self._episode_time = time.time()
@@ -351,3 +370,9 @@ class NPIAddEnv(gym.Env):
 
         return observation, reward, done, to_log
 
+    def _after_reset(self, observation):
+        logger.info('Resetting environment')
+        self._episode_reward = 0
+        self._episode_length = 0
+        self._all_rewards = []
+        return observation
