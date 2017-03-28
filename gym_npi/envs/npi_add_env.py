@@ -1,4 +1,3 @@
-"""Generate a fully supervised trace for addition."""
 import time
 import logging
 import functools
@@ -98,7 +97,7 @@ class ProgramNode(object):
     def failed(self, reason):
         """There are a million ways to fail. So this makes it easy to handle.
         """
-        print(reason)
+        # print(reason)
         return (None, -1.0, True, {'env/failure': reason})
 
     def completed_all_subprograms(self):
@@ -165,6 +164,8 @@ class NPIAddEnv(gym.Env):
 
         self.step_sum = 0
 
+        self.input_trace = []
+        self.output_trace = []
         self._trace = []
         self._cur_node = None
         self.time = 0
@@ -186,6 +187,9 @@ class NPIAddEnv(gym.Env):
 
         # Clear truth scratch pad for agent
         self._reset_scratch()
+
+    def get_supervised_trace(self):
+        return zip(self.input_trace, self.output_trace)
 
     def _step(self, action):
         assert self.action_space.contains(action)
@@ -245,15 +249,54 @@ class NPIAddEnv(gym.Env):
         self._scratch = np.copy(self._init_scratch)
         self._ptrs = [4, 4, 4, 4]
 
+    def amend_trace(self, line, do_return=False):
+        # print(
+        #     '{0}{1} {2} {3} {4}'.format(
+        #         ' ' * self.indent,
+        #         PROGRAMS[line[0]],
+        #         PRIMITIVES[line[1]],
+        #         POINTERS[line[2]],
+        #         ARGS[line[3]]
+        #     )
+        # )
+
+        self.input_trace.append(self._get_obs() + line)
+        if len(self.input_trace) > 1:
+            self.output_trace.append(
+                [1 if do_return else 0] + line
+            )
+
     # Primitive Operations
-    def _write(self, ptr_id, value):
+    def _write(self, ptr_id, value, do_return=False, trace=False):
+        if trace:
+            self.amend_trace(
+                [
+                    PROGRAMS.index('act'),
+                    PRIMITIVES.index('write'),
+                    POINTERS.index('out'),
+                    value
+                ],
+                do_return
+            )
+
         write_col = self._ptrs[ptr_id]
         try:
             self._scratch[ptr_id, write_col] = value
         except IndexError:
             pass
 
-    def _ptr(self, ptr_id, direction):
+    def _ptr(self, ptr_id, direction, do_return=False, trace=False):
+        if trace:
+            self.amend_trace(
+                [
+                    PROGRAMS.index('act'),
+                    PRIMITIVES.index('ptr'),
+                    ptr_id,
+                    direction
+                ],
+                do_return
+            )
+
         if direction == ARGS.index('left'):
             self._ptrs[ptr_id] -= 1
         elif direction == ARGS.index('right'):
@@ -261,49 +304,63 @@ class NPIAddEnv(gym.Env):
 
     # Compound Operations
     @program_wrapper
-    def _carry(self, node, prev):
+    def _carry(self, node, prev, do_return=False):
+        self.amend_trace([PROGRAMS.index('carry'), 0, 0, 0], do_return)
         node.is_leaf = True
         node.prev = prev
 
-        self._ptr(POINTERS.index('carry'), ARGS.index('left'))
-        self._write(POINTERS.index('carry'), 1)
-        self._ptr(POINTERS.index('carry'), ARGS.index('right'))
+        self._ptr(POINTERS.index('carry'), ARGS.index('left'), trace=True)
+        self._write(POINTERS.index('carry'), 1, trace=True)
+        self._ptr(POINTERS.index('carry'), ARGS.index('right'), trace=True)
 
     @program_wrapper
-    def _lshift(self, node, prev):
+    def _lshift(self, node, prev, do_return=False):
+        self.amend_trace([PROGRAMS.index('lshift'), 0, 0, 0], do_return)
         node.is_leaf = True
         node.prev = prev
 
         node.subprograms.append(
-            self._ptr(POINTERS.index('in1'), ARGS.index('left'))
+            self._ptr(POINTERS.index('in1'), ARGS.index('left'), trace=True)
         )
         node.subprograms.append(
-            self._ptr(POINTERS.index('in2'), ARGS.index('left'))
+            self._ptr(POINTERS.index('in2'), ARGS.index('left'), trace=True)
         )
         node.subprograms.append(
-            self._ptr(POINTERS.index('carry'), ARGS.index('left'))
+            self._ptr(POINTERS.index('carry'), ARGS.index('left'), trace=True)
         )
         node.subprograms.append(
-            self._ptr(POINTERS.index('out'), ARGS.index('left'))
+            self._ptr(
+                POINTERS.index('out'),
+                ARGS.index('left'),
+                do_return=True,
+                trace=True
+            )
         )
 
     @program_wrapper
-    def _add1(self, node, prev):
+    def _add1(self, node, prev, do_return=False):
+        self.amend_trace([PROGRAMS.index('add1'), 0, 0, 0], do_return)
         node.prev = prev
         if self.step_sum > 9:
             out_value = self.step_sum % 10
-            self._write(POINTERS.index('out'), out_value)
-            node.subprograms.append(self._carry(node))
+            self._write(POINTERS.index('out'), out_value, trace=True)
+            node.subprograms.append(self._carry(node, do_return=True))
         else:
             node.is_leaf = True
-            self._write(POINTERS.index('out'), self.step_sum)
+            self._write(
+                POINTERS.index('out'),
+                self.step_sum,
+                do_return=True,
+                trace=True
+            )
 
     @program_wrapper
-    def _add(self, node, prev=None):
+    def _add(self, node, prev=None, do_return=False):
+        self.amend_trace([PROGRAMS.index('add'), 0, 0, 0], do_return)
         while self._keep_adding():
             add1 = self._add1(node)
             node.subprograms.append(add1)
-            lshift = self._lshift(node)
+            lshift = self._lshift(node, do_return=True)
             node.subprograms.append(lshift)
 
     def _keep_adding(self):
@@ -385,7 +442,7 @@ class NPIAddEnv(gym.Env):
         return observation, reward, done, to_log
 
     def _after_reset(self, observation):
-        logger.info('Resetting environment')
+        # logger.info('Resetting environment')
         self._episode_reward = 0
         self._episode_length = 0
         self._all_rewards = []
