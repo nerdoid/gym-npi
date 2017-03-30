@@ -25,7 +25,10 @@ class ProgramNode(object):
         self.prog_id = PROGRAMS.index(prog_name)
         self.entry_obs = entry_obs
         self.is_leaf = False
-        self.exit_obs = None
+        self.entry_scratch = None
+        self.entry_ptrs = None
+        self.exit_scratch = None
+        self.exit_ptrs = None
         self.prev = None
         self.subprograms = []
         self.sub_index = 0
@@ -33,7 +36,7 @@ class ProgramNode(object):
         self.time_limit = 20
         self.ret = False
 
-    def step(self, prog, ret, obs):
+    def step(self, prog, ret, env):
         """Each step the agent has done one of three things:
             1. Exited the current program
             2. Entered a new subprogram
@@ -50,7 +53,7 @@ class ProgramNode(object):
         if prog == PROGRAMS.index('act'):
             if ret == 1:
                 self.ret = 1
-                return self.traverse_return(obs)
+                return self.traverse_return(env)
 
             return (self, 0.0, False, {})
 
@@ -72,7 +75,7 @@ class ProgramNode(object):
                 return self.failed('executed_too_many_subprograms')
             elif prog != self.subprograms[self.sub_index].prog_id:
                 return self.failed('wrong_next_subprogram')
-            elif obs != self.subprograms[self.sub_index].entry_obs:
+            elif not self.subprograms[self.sub_index].correct_entry(env):
                 return self.failed('wrong_entry_obs')
             else:
                 # The agent successfully called a subprogram.
@@ -80,7 +83,7 @@ class ProgramNode(object):
                 self.sub_index += 1
                 return (next_node, 1.0, False, {})
 
-    def traverse_return(self, obs, reward=0):
+    def traverse_return(self, env, reward=0):
         """Traverses the call graph upward until it reaches a node that has
         not received a return flag. Each successful step in the traversal
         adds 1 to the accumulated reward that is returned at the end.
@@ -88,20 +91,35 @@ class ProgramNode(object):
         if self.ret == 0:
             return (self, reward, False, {})
 
-        if obs == self.exit_obs and self.completed_all_subprograms():
-            reward += 1
-            return self.prev.traverse_return(obs, reward=reward)
+        if self.correct_exit(env) and self.completed_all_subprograms():
+            if self.prev == None:
+                return (None, 1.0 + reward, True, {'env/success': True})
+            else:
+                reward += 1
+                return self.prev.traverse_return(env._scratch, reward=reward)
         else:
-            return self.failed('bad_exit_obs')
+            return self.failed('bad_exit_scratch')
+
+    def correct_entry(self, env):
+        scratches_equal = np.equal(env._scratch, self.entry_scratch).all()
+        ptrs_equal = np.equal(env._ptrs, self.entry_ptrs).all()
+
+        return scratches_equal and ptrs_equal
+
+    def correct_exit(self, env):
+        scratches_equal = np.equal(env._scratch, self.exit_scratch).all()
+        ptrs_equal = np.equal(env._ptrs, self.exit_ptrs).all()
+
+        return scratches_equal and ptrs_equal
 
     def failed(self, reason):
         """There are a million ways to fail. So this makes it easy to handle.
         """
-        # print(reason)
+        print(reason)
         return (None, -1.0, True, {'env/failure': reason})
 
     def completed_all_subprograms(self):
-        return self.sub_index == len(self.subprograms)
+        return self.is_leaf or self.sub_index == len(self.subprograms)
 
 
 def program_wrapper(f):
@@ -109,8 +127,11 @@ def program_wrapper(f):
     def wrapper(self, *args, **kwargs):
         name = f.__name__.lstrip('_')
         node = ProgramNode(name, self._get_obs())
+        node.entry_scratch = np.copy(self._scratch)
+        node.entry_ptrs = list(self._ptrs)
         f(self, node, *args, **kwargs)
-        node.exit_obs = self._get_obs()
+        node.exit_scratch = np.copy(self._scratch)
+        node.exit_ptrs = list(self._ptrs)
         return node
 
     return wrapper
@@ -183,7 +204,9 @@ class NPIAddEnv(gym.Env):
         # Clear agent's scratch pad
         self._reset_scratch()
 
-        self._trace = self._add()
+        # TODO Use curriculum to select correct function to start generation
+        # self._trace = self._add()
+        self._trace = self._lshift(do_return=True)
 
         # Clear truth scratch pad for agent
         self._reset_scratch()
@@ -208,7 +231,7 @@ class NPIAddEnv(gym.Env):
         obs = self._get_obs()
 
         self._cur_node, reward, done, info = self._cur_node.step(
-            prog, ret, obs
+            prog, ret, self
         )
 
         return self._after_step(obs, reward, done, {})
@@ -304,7 +327,7 @@ class NPIAddEnv(gym.Env):
 
     # Compound Operations
     @program_wrapper
-    def _carry(self, node, prev, do_return=False):
+    def _carry(self, node, prev=None, do_return=False):
         self.amend_trace([PROGRAMS.index('carry'), 0, 0, 0], do_return)
         node.is_leaf = True
         node.prev = prev
@@ -314,7 +337,7 @@ class NPIAddEnv(gym.Env):
         self._ptr(POINTERS.index('carry'), ARGS.index('right'), trace=True)
 
     @program_wrapper
-    def _lshift(self, node, prev, do_return=False):
+    def _lshift(self, node, prev=None, do_return=False):
         self.amend_trace([PROGRAMS.index('lshift'), 0, 0, 0], do_return)
         node.is_leaf = True
         node.prev = prev
@@ -338,7 +361,7 @@ class NPIAddEnv(gym.Env):
         )
 
     @program_wrapper
-    def _add1(self, node, prev, do_return=False):
+    def _add1(self, node, prev=None, do_return=False):
         self.amend_trace([PROGRAMS.index('add1'), 0, 0, 0], do_return)
         node.prev = prev
         if self.step_sum > 9:
