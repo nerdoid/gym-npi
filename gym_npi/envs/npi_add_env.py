@@ -47,7 +47,7 @@ class ProgramNode(object):
         """
         self.time_step += 1
         if self.time_step > self.time_limit:
-            return (None, -1.0, True, {'env/failure': 'out_of_time'})
+            return (self, -1.0, True, {'env/failure': 'out_of_time'})
 
         # Executed primitive?
         if prog == PROGRAMS.index('act'):
@@ -93,7 +93,7 @@ class ProgramNode(object):
 
         if self.correct_exit(env) and self.completed_all_subprograms():
             if self.prev == None:
-                return (None, 1.0 + reward, True, {'env/success': True})
+                return (self, 1.0 + reward, True, {'env/success': True})
             else:
                 reward += 1
                 return self.prev.traverse_return(env._scratch, reward=reward)
@@ -116,7 +116,7 @@ class ProgramNode(object):
         """There are a million ways to fail. So this makes it easy to handle.
         """
         print(reason)
-        return (None, -1.0, True, {'env/failure': reason})
+        return (self, -1.0, True, {'env/failure': reason})
 
     def completed_all_subprograms(self):
         return self.is_leaf or self.sub_index == len(self.subprograms)
@@ -233,6 +233,13 @@ class NPIAddEnv(gym.Env):
         self._cur_node, reward, done, info = self._cur_node.step(
             prog, ret, self
         )
+
+        # Add a distance-based reward at end of episode
+        if done:
+            ptr_diff = np.subtract(self._ptrs, self._cur_node.exit_ptrs)
+            for diff in ptr_diff:
+                if diff == 0:
+                    reward += 1
 
         return self._after_step(obs, reward, done, {})
 
