@@ -1,2 +1,2 @@
 # gym-npi
-OpenAI gym environment for algorithms described in the Neural Programmer-Interpreters paper
+OpenAI Gym environment for addition algorithm described in the Neural Programmer-Interpreters paper. Incomplete.
